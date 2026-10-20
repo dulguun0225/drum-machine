@@ -3,7 +3,7 @@
 
 import { AudioOut } from "./audio";
 import { demoProject } from "./demo";
-import { Player, effectiveMode, type TimedEvent } from "./engine";
+import { Player, effectiveMode, type BeatEvent, type TimedEvent } from "./engine";
 import { History } from "./history";
 import type { SoundKey } from "./kit";
 import {
@@ -12,7 +12,6 @@ import {
   findPattern,
   parseProjectText,
   serializeProject,
-  stepBeats,
   type Pattern,
   type Project,
   type Track,
@@ -61,7 +60,7 @@ export interface UiState {
   theme: Theme;
   position: string;
   playingPatternId: string | null;
-  playingEntry: number;
+  playingEntryId: string | null; // song entry id, null in pattern mode
   playhead: Map<string, number>; // trackId → current step
   euclid: { hits: number; steps: number; rotation: number };
   tuplet: { trackId: string; steps: number; beats: number } | null;
@@ -109,7 +108,7 @@ export class App {
       theme: loadTheme(),
       position: "1.1",
       playingPatternId: null,
-      playingEntry: -1,
+      playingEntryId: null,
       playhead: new Map(),
       euclid: { hits: 4, steps: 16, rotation: 0 },
       tuplet: null,
@@ -186,12 +185,12 @@ export class App {
 
   undo(): void {
     const prev = this.history.undo(structuredClone(this.project));
-    if (prev) this.replace(prev);
+    if (prev) this.replace(keepCurrentPattern(prev, this.project));
   }
 
   redo(): void {
     const next = this.history.redo(structuredClone(this.project));
-    if (next) this.replace(next);
+    if (next) this.replace(keepCurrentPattern(next, this.project));
   }
 
   /** Load a whole project (import, demo, new) as one undo step. */
@@ -287,7 +286,7 @@ export class App {
     this.player = Player.start(this.project, ctx.currentTime);
     this.queue = [];
     this.ui.playing = true;
-    this.ui.playingEntry = -1;
+    this.ui.playingEntryId = null;
     this.ticker.start();
     this.tick();
     requestAnimationFrame(this.frame);
@@ -302,7 +301,7 @@ export class App {
     this.ui.playing = false;
     this.ui.playhead.clear();
     this.ui.playingPatternId = null;
-    this.ui.playingEntry = -1;
+    this.ui.playingEntryId = null;
     this.ui.position = "1.1";
     this.endGesture();
     this.render();
@@ -319,6 +318,7 @@ export class App {
         this.queue.push(e);
       }
     }
+    this.queue = pruneQueue(this.queue, ctx.currentTime - this.audio.latency);
   }
 
   /** Apply queued step and beat events that are now audible: playhead, position, follow. */
@@ -345,16 +345,13 @@ export class App {
     document.getElementById(cellId(trackId, step))?.classList.add("now");
   }
 
-  private showBeat(e: Extract<TimedEvent, { type: "beat" }>) {
-    const p = findPattern(this.project, e.patternId);
-    const bars = p?.bars ?? 1;
-    const pos = `${(e.bar % bars) + 1}.${e.beatInBar + 1}`;
-    this.ui.position = e.entry >= 0 ? `${e.entry + 1}:${Math.floor(e.bar / bars) + 1} ${pos}` : pos;
+  private showBeat(e: BeatEvent) {
+    this.ui.position = positionText(this.project, e);
     const out = document.getElementById("position");
     if (out) out.textContent = this.ui.position;
-    if (e.patternId !== this.ui.playingPatternId || e.entry !== this.ui.playingEntry) {
+    if (e.patternId !== this.ui.playingPatternId || e.entryId !== this.ui.playingEntryId) {
       this.ui.playingPatternId = e.patternId;
-      this.ui.playingEntry = e.entry;
+      this.ui.playingEntryId = e.entryId;
       const follow =
         this.ui.follow &&
         effectiveMode(this.project) === "song" &&
@@ -379,25 +376,84 @@ export class App {
       semitones: track.tune,
       decay: track.decay,
       choke: track.choke,
+      order: this.pattern.tracks.indexOf(track),
     });
   }
 
-  /** Audition the track; when recording during playback, write a hit at its nearest step. */
+  /**
+   * Audition the track; when recording during playback, write a hit at its nearest step so
+   * that the hit sounds once (see `recordPlan`).
+   */
   recordHit(track: Track): void {
-    this.audition(track);
     const ctx = this.audio.ctx;
-    if (!this.ui.record || !this.player || !ctx) return;
-    const at = this.player.locate(ctx.currentTime - this.audio.latency);
-    if (!at || at.segment.patternId !== this.pattern.id) return;
-    const n = track.steps.length;
-    const k = Math.round((at.beat - at.segment.start) / stepBeats(track));
-    const index = ((k % n) + n) % n;
+    const live = this.pattern.tracks.find((t) => t.id === track.id);
+    const near =
+      this.ui.record && this.player && ctx && live
+        ? this.player.nearestStep(live, ctx.currentTime - this.audio.latency)
+        : undefined;
+    if (!this.player || !live || !near || near.segment.patternId !== this.pattern.id) {
+      this.audition(track);
+      return;
+    }
+    const { index } = near;
+    const plan = recordPlan(near.upcoming, live.steps[index].on);
+    if (plan.audition) this.audition(live);
+    if (plan.skip) this.player.skipOnce(near.segment, track.id, near.k);
     this.updateTrack(
       track.id,
       (t) => (t.steps[index] = { ...t.steps[index], on: true, velocity: DEFAULT_VELOCITY }),
       "record",
     );
   }
+}
+
+/**
+ * Live record of a key press at its nearest step. An upcoming step that is already on plays
+ * anyway, so the press is not auditioned. An upcoming step that was off is auditioned now and
+ * skipped once when playback reaches it. A step that has passed is auditioned and plays from
+ * the next loop on.
+ */
+export function recordPlan(
+  upcoming: boolean,
+  wasOn: boolean,
+): { audition: boolean; skip: boolean } {
+  return { audition: !(upcoming && wasOn), skip: upcoming && !wasOn };
+}
+
+/** Undo/redo snapshot with the live current pattern kept when it still exists (it may be playing). */
+export function keepCurrentPattern(snapshot: Project, live: Project): Project {
+  if (findPattern(snapshot, live.currentPatternId))
+    snapshot.currentPatternId = live.currentPatternId;
+  return snapshot;
+}
+
+/**
+ * Playhead events still worth applying at `now`: all future ones, and of the due ones only the
+ * last step per track and the last beat, which is all the next frame would leave visible. This
+ * bounds the queue while requestAnimationFrame does not run (hidden tab).
+ */
+export function pruneQueue(queue: TimedEvent[], now: number): TimedEvent[] {
+  const seen = new Set<string>();
+  const out: TimedEvent[] = [];
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const e = queue[i];
+    if (e.time <= now) {
+      const key = e.type === "step" ? `step|${e.trackId}` : e.type;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(e);
+  }
+  return out.reverse();
+}
+
+/** Position readout "bar.beat"; song mode adds "entry:repeat" with the entry's current number. */
+export function positionText(project: Project, e: BeatEvent): string {
+  const bars = findPattern(project, e.patternId)?.bars ?? 1;
+  const pos = `${(e.bar % bars) + 1}.${e.beatInBar + 1}`;
+  if (e.entryId === null) return pos;
+  const i = project.song.findIndex((x) => x.id === e.entryId);
+  return `${i >= 0 ? i + 1 : "–"}:${Math.floor(e.bar / bars) + 1} ${pos}`;
 }
 
 export function cellId(trackId: string, step: number): string {

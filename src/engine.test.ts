@@ -3,6 +3,7 @@ import {
   FLAM_SECONDS,
   Player,
   Sequencer,
+  type BeatEvent,
   TempoMap,
   seededRng,
   type EngineEvent,
@@ -50,6 +51,30 @@ function ticks(player: Player, p: Project, from: number, to: number): TimedEvent
   for (let now = from; now < to; now += 0.025) out.push(...player.tick(p, now, rng));
   return out;
 }
+
+/** Clock driving a player in 25 ms ticks; `until(beat)` runs it until the playhead reaches `beat`. */
+function clock(player: Player, p: Project, start = 0) {
+  let now = start;
+  return {
+    get now() {
+      return now;
+    },
+    until(beat: number): TimedEvent[] {
+      const out: TimedEvent[] = [];
+      while (player.tempo.beatAt(now) < beat) {
+        out.push(...player.tick(p, now, rng));
+        now += 0.025;
+      }
+      return out;
+    },
+  };
+}
+
+/** Song entry id at the start of each 4-beat bar, as the beat events report it. */
+const barEntries = (events: EngineEvent[]) =>
+  events
+    .filter((e): e is BeatEvent => e.type === "beat" && e.beatInBar === 0)
+    .map((e) => e.entryId);
 
 function setStep(t: Track, i: number, over: Partial<Step>) {
   t.steps[i] = { ...t.steps[i], on: true, ...over };
@@ -158,9 +183,17 @@ describe("polymeter and pattern switching", () => {
     expect(steps(events, bTrack.id)[0]).toMatchObject({ beat: 8, step: 0 });
     expect(aSteps.find((e) => e.beat === 12)?.step).toBe(0);
     const beatEvents = events.filter((e) => e.type === "beat");
-    expect(beatEvents.find((e) => e.beat === 8)).toMatchObject({ entry: 1, bar: 0, beatInBar: 0 });
-    expect(beatEvents.find((e) => e.beat === 12)).toMatchObject({ entry: 0, bar: 0 });
-    expect(beatEvents.find((e) => e.beat === 5)).toMatchObject({ entry: 0, bar: 1, beatInBar: 1 });
+    expect(beatEvents.find((e) => e.beat === 8)).toMatchObject({
+      entryId: "e-b-1",
+      bar: 0,
+      beatInBar: 0,
+    });
+    expect(beatEvents.find((e) => e.beat === 12)).toMatchObject({ entryId: "e-a-2", bar: 0 });
+    expect(beatEvents.find((e) => e.beat === 5)).toMatchObject({
+      entryId: "e-a-2",
+      bar: 1,
+      beatInBar: 1,
+    });
   });
 
   it("switches from pattern mode to song mode at the next pattern boundary", () => {
@@ -172,8 +205,12 @@ describe("polymeter and pattern switching", () => {
     p.playMode = "song";
     p.song = [{ id: `e-b-1`, patternId: b.id, repeats: 1 }];
     const beats = seq.advance(p, 12, rng).filter((e) => e.type === "beat");
-    expect(beats.find((e) => e.beat === 7)).toMatchObject({ patternId: a.id, entry: -1 });
-    expect(beats.find((e) => e.beat === 8)).toMatchObject({ patternId: b.id, entry: 0, bar: 0 });
+    expect(beats.find((e) => e.beat === 7)).toMatchObject({ patternId: a.id, entryId: null });
+    expect(beats.find((e) => e.beat === 8)).toMatchObject({
+      patternId: b.id,
+      entryId: "e-b-1",
+      bar: 0,
+    });
   });
 
   it("uses the time signature for beat events (7/8)", () => {
@@ -328,5 +365,144 @@ describe("tempo and scheduling", () => {
     const at = player.locate(1.25);
     expect(at?.beat).toBeCloseTo(0.5, 12);
     expect(at?.segment.patternId).toBe(p.patterns[0].id);
+  });
+});
+
+describe("start and queued switches", () => {
+  it("starts a 1/1 track at 60 BPM within 0.1 s of Play", () => {
+    const p = project([pattern([track("xxxx", { num: 1, den: 1 })])], { bpm: 60 });
+    const first = hits(ticks(Player.start(p, 5), p, 5, 6))[0] as TimedEvent;
+    expect(first.time - 5).toBeLessThanOrEqual(0.1);
+  });
+
+  it("lands a switch chosen at beat 2.05 of a 4-beat pattern at beat 4 with a 1/1 track", () => {
+    const a = pattern([track("xxxx", { num: 1, den: 1 })]);
+    const b = pattern([track("xxxx", { num: 1, den: 1 })]);
+    const p = project([a, b], { bpm: 60 });
+    const run = clock(Player.start(p, 0), p);
+    const before = run.until(2.05);
+    p.currentPatternId = b.id;
+    const events = [...before, ...run.until(12)];
+    expect(events.find((e) => e.patternId === b.id)).toMatchObject({ type: "beat", at: 4 });
+    expect(events.filter((e) => e.patternId === a.id && e.at >= 4)).toEqual([]);
+  });
+});
+
+describe("edits during playback", () => {
+  it("keeps ratchets in order before the next step across a 60 → 240 BPM change", () => {
+    const t = track("xxxx", { num: 1, den: 1 });
+    t.steps = t.steps.map((s) => ({ ...s, ratchet: 4 }));
+    const p = project([pattern([t])], { bpm: 60 });
+    const player = new Player(p, 0);
+    const played: TimedEvent[] = [];
+    for (let now = 0; now < 6; now += 0.025) {
+      if (now >= 2.2) p.bpm = 240;
+      played.push(...hits(player.tick(p, now, rng)).map((e) => e as TimedEvent));
+    }
+    const byBeat = played.toSorted((x, y) => x.beat - y.beat);
+    expect(byBeat.slice(0, 40).map((e) => e.beat)).toEqual(
+      Array.from({ length: 40 }, (_, i) => i / 4),
+    );
+    byBeat.slice(1).forEach((e, i) => expect(e.time).toBeGreaterThan(byBeat[i].time));
+  });
+
+  it("skips a hit that a grown step duration would make late, then plays on", () => {
+    const t = track("x".repeat(16));
+    t.steps = t.steps.map((s) => ({ ...s, nudge: -0.5 }));
+    const p = project([pattern([t])]);
+    const player = Player.start(p, 0);
+    const played: TimedEvent[] = [];
+    let changed = false;
+    for (let now = 0; now < 8; now += 0.025) {
+      if (!changed && player.tempo.beatAt(now) >= 2.5) {
+        t.stepDur = { num: 4, den: 1 }; // nudge −0.5 now moves hits 2 beats early
+        changed = true;
+      }
+      for (const e of hits(player.tick(p, now, rng)) as (HitEvent & TimedEvent)[]) {
+        expect(e.time).toBeGreaterThanOrEqual(now);
+        played.push(e);
+      }
+    }
+    const after = played.filter((e) => e.at >= 4).map((e) => e.at);
+    expect(after).not.toContain(4); // its hit at beat 2 was already in the past
+    expect(after.slice(0, 2)).toEqual([8, 12]);
+  });
+});
+
+describe("song edits during playback", () => {
+  const songProject = (ids: string[]) => {
+    const patterns = ids.map(() => pattern([track("x", { num: 1, den: 1 })]));
+    return project(patterns, {
+      playMode: "song",
+      song: ids.map((id, i) => ({ id, patternId: patterns[i].id, repeats: 1 })),
+    });
+  };
+
+  it("continues with the entry now at the old position when the playing entry is deleted", () => {
+    const p = songProject(["a", "b", "c"]);
+    const run = clock(new Player(p, 0), p);
+    const events = run.until(1);
+    p.song.splice(0, 1);
+    events.push(...run.until(20));
+    expect(barEntries(events).slice(0, 5)).toEqual(["a", "b", "c", "b", "c"]);
+  });
+
+  it("plays the entry after a deleted one that was not playing", () => {
+    const p = songProject(["a", "b", "c"]);
+    const run = clock(new Player(p, 0), p);
+    const events = run.until(1);
+    p.song.splice(1, 1);
+    events.push(...run.until(20));
+    expect(barEntries(events).slice(0, 5)).toEqual(["a", "c", "a", "c", "a"]);
+  });
+
+  it("follows the playing entry to its new position when entries are moved", () => {
+    const p = songProject(["a", "b", "c"]);
+    const run = clock(new Player(p, 0), p);
+    const events = run.until(1);
+    [p.song[0], p.song[1]] = [p.song[1], p.song[0]]; // a moves down: b, a, c
+    events.push(...run.until(5));
+    [p.song[2], p.song[1]] = [p.song[1], p.song[2]]; // c moves up while c plays: b, c, a
+    events.push(...run.until(20));
+    expect(barEntries(events).slice(0, 6)).toEqual(["a", "c", "a", "b", "c", "a"]);
+  });
+
+  it("applies changed repeats of the playing entry at a pattern boundary", () => {
+    const p = songProject(["a", "b"]);
+    const run = clock(new Player(p, 0), p);
+    const events = run.until(1);
+    p.song[0].repeats = 3; // longer: plays on
+    events.push(...run.until(9));
+    p.song[0].repeats = 1; // now behind the playhead: ends after the current repeat
+    events.push(...run.until(13));
+    p.song[1].repeats = 2;
+    events.push(...run.until(28));
+    expect(barEntries(events).slice(0, 7)).toEqual(["a", "a", "a", "b", "b", "a", "b"]);
+  });
+});
+
+describe("live record", () => {
+  it("skips the hit of an upcoming step once when it was played live", () => {
+    const t = track("....", { num: 1, den: 1 });
+    const p = project([pattern([t])]);
+    const player = new Player(p, 0);
+    const run = clock(player, p);
+    const events = run.until(1.6); // step 2 (beat 2) is nearest and not scanned yet
+    const near = player.nearestStep(t, run.now);
+    expect(near).toMatchObject({ k: 2, index: 2, upcoming: true });
+    if (!near) return;
+    setStep(t, near.index, {});
+    player.skipOnce(near.segment, t.id, near.k);
+    events.push(...run.until(12));
+    expect(hits(events).map((e) => e.at)).toEqual([6, 10]);
+  });
+
+  it("reports a step that has just played as not upcoming", () => {
+    const t = track("....", { num: 1, den: 1 });
+    const p = project([pattern([t])]);
+    const player = new Player(p, 0);
+    const run = clock(player, p);
+    run.until(2.1);
+    expect(player.nearestStep(t, run.now)).toMatchObject({ k: 2, upcoming: false });
   });
 });

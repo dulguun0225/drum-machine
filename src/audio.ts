@@ -7,18 +7,35 @@ import { perceptualGain, playSound } from "./sounds";
 
 const CHOKE_FADE = 0.005;
 const STOP_FADE = 0.01;
+/** Start times closer than this (seconds) count as the same time for choke groups. */
+const SAME_TIME = 1e-6;
 
 interface Channel {
   gain: GainNode;
   pan: StereoPannerNode;
 }
 
-interface ActiveVoice {
+/** Timing of a voice, as far as choke groups need it. */
+export interface VoiceSpan {
   start: number;
   end: number;
+  cut: number; // time the voice is faded out, Infinity if never
+  order: number; // track index in the pattern
+}
+
+interface ActiveVoice extends VoiceSpan {
   gain: GainNode;
   choke: number;
-  cut: number; // time the voice is faded out, Infinity if never
+}
+
+/**
+ * True when voice `a` cuts voice `b` of the same choke group: `a` starts while `b` sounds, and
+ * `b` started earlier, or at the same time on the same or an earlier track.
+ */
+export function cuts(a: VoiceSpan, b: VoiceSpan): boolean {
+  if (a.start >= Math.min(b.end, b.cut)) return false;
+  if (Math.abs(a.start - b.start) <= SAME_TIME) return a.order >= b.order;
+  return b.start < a.start;
 }
 
 export interface HitParams {
@@ -29,6 +46,7 @@ export interface HitParams {
   semitones: number;
   decay: number;
   choke: number;
+  order: number; // track index in the pattern (choke tie-break)
 }
 
 export class AudioOut {
@@ -98,16 +116,14 @@ export class AudioOut {
     }
   }
 
-  private newVoice(start: number, end: number, gain: GainNode, choke: number) {
-    const voice: ActiveVoice = { start, end, gain, choke, cut: Infinity };
+  private newVoice(start: number, end: number, gain: GainNode, choke: number, order: number) {
+    const voice: ActiveVoice = { start, end, gain, choke, order, cut: Infinity };
     if (choke > 0) {
       for (const other of this.voices) {
         if (other.choke !== choke) continue;
-        // An earlier voice still sounding is faded at this start; a later one (scheduled out
-        // of order, e.g. by negative nudge) fades this voice at its own start.
-        if (other.start < start && Math.min(other.end, other.cut) > start)
-          this.cutVoice(other, start);
-        else if (other.start > start && other.start < end) this.cutVoice(voice, other.start);
+        // Voices can be scheduled out of order (negative nudge), so the cut goes either way.
+        if (cuts(voice, other)) this.cutVoice(other, start);
+        else if (cuts(other, voice)) this.cutVoice(voice, other.start);
       }
     }
     this.voices.push(voice);
@@ -136,7 +152,7 @@ export class AudioOut {
       semitones: h.semitones,
       decay: h.decay,
     });
-    this.newVoice(time, end, gain, h.choke);
+    this.newVoice(time, end, gain, h.choke, h.order);
   }
 
   /** Metronome click straight to the master bus; higher and louder on the bar start. */
@@ -153,7 +169,7 @@ export class AudioOut {
     osc.connect(env).connect(gain);
     osc.start(time);
     osc.stop(time + 0.03);
-    this.newVoice(time, time + 0.03, gain, 0);
+    this.newVoice(time, time + 0.03, gain, 0, 0);
   }
 
   /** Fade every sounding and already scheduled voice (transport stop). */

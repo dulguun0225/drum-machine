@@ -24,7 +24,7 @@ export function songPanelView(app: App): HTMLElement {
     h(
       "li",
       {
-        class: cls("entry", ui.playing && ui.playingEntry === i && "playing"),
+        class: cls("entry", ui.playing && ui.playingEntryId === entry.id && "playing"),
         "data-key": `entry-${entry.id}`,
       },
       h("span", { class: "entry-index", "aria-hidden": "true" }, i + 1),

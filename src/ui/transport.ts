@@ -52,7 +52,7 @@ export function transportView(app: App): HTMLElement {
         h(
           "span",
           { class: "label", id: "position-label" },
-          ui.playingEntry >= 0 ? "Entry:rep bar.beat" : "Bar.beat",
+          ui.playingEntryId !== null ? "Entry:rep bar.beat" : "Bar.beat",
         ),
         h(
           "output",

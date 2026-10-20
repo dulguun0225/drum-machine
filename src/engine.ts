@@ -77,8 +77,7 @@ export interface BeatEvent {
   beat: number;
   offset: 0;
   patternId: string;
-  entry: number; // song entry index when emitted, −1 in pattern mode
-  entryId: string | null;
+  entryId: string | null; // song entry id, null in pattern mode
   bar: number; // bar index from the segment start
   beatInBar: number;
 }
@@ -264,7 +263,7 @@ export class Sequencer {
     out: EngineEvent[],
   ) {
     const pattern = findPattern(project, seg.patternId);
-    this.emitBeats(project, seg, pattern, from, to, out);
+    this.emitBeats(seg, pattern, from, to, out);
     if (!pattern) return;
     const anySolo = pattern.tracks.some((t) => t.solo);
     pattern.tracks.forEach((track, order) => {
@@ -274,7 +273,6 @@ export class Sequencer {
   }
 
   private emitBeats(
-    project: Project,
     seg: Segment,
     pattern: Pattern | undefined,
     from: number,
@@ -283,7 +281,6 @@ export class Sequencer {
   ) {
     const den = pattern?.sigDen ?? 4;
     const perBar = pattern?.sigNum ?? 4;
-    const entry = seg.mode === "song" ? entryIndex(project, seg) : -1;
     for (let j = firstIndex(seg.start, from, 4, den); ; j++) {
       const beat = seg.start + (j * 4) / den;
       if (beat >= to) break;
@@ -294,7 +291,6 @@ export class Sequencer {
         beat,
         offset: 0,
         patternId: seg.patternId,
-        entry,
         entryId: seg.entryId,
         bar: Math.floor(j / perBar),
         beatInBar: j % perBar,

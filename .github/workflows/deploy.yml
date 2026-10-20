@@ -1,0 +1,46 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # vp is the npm package vite-plus (requires ^22.18.0 || ^24.11.0 || >=26).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Installs vp from mise.toml.
+      - uses: jdx/mise-action@v5
+      # pnpm is downloaded per devEngines in package.json; CI=true makes the install frozen.
+      - run: mise exec -- vp install
+      - run: mise exec -- vp check
+      - run: mise exec -- vp test
+      - run: mise exec -- vp build
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
