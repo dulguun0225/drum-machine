@@ -74,6 +74,8 @@ export class App {
   private readonly history = new History<Project>();
   private player: Player | null = null;
   private queue: TimedEvent[] = [];
+  /** Last beat shown; the position text is recomputed from it on every render, so song edits update it at once. */
+  private lastBeat: BeatEvent | null = null;
   private renderQueued = false;
   private confirmTimer: number | undefined;
   private readonly ticker = createTicker(() => this.tick());
@@ -259,6 +261,7 @@ export class App {
     this.renderQueued = true;
     requestAnimationFrame(() => {
       this.renderQueued = false;
+      if (this.lastBeat) this.ui.position = positionText(this.project, this.lastBeat);
       this.renderView(this);
       if (this.focusId) {
         document.getElementById(this.focusId)?.focus();
@@ -285,6 +288,7 @@ export class App {
     this.audio.updateMix(this.project);
     this.player = Player.start(this.project, ctx.currentTime);
     this.queue = [];
+    this.lastBeat = null;
     this.ui.playing = true;
     this.ui.playingEntryId = null;
     this.ticker.start();
@@ -298,6 +302,7 @@ export class App {
     this.audio.silence();
     this.player = null;
     this.queue = [];
+    this.lastBeat = null;
     this.ui.playing = false;
     this.ui.playhead.clear();
     this.ui.playingPatternId = null;
@@ -346,6 +351,7 @@ export class App {
   }
 
   private showBeat(e: BeatEvent) {
+    this.lastBeat = e;
     this.ui.position = positionText(this.project, e);
     const out = document.getElementById("position");
     if (out) out.textContent = this.ui.position;
