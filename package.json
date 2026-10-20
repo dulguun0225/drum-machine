@@ -1,0 +1,26 @@
+{
+  "name": "drum-machine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "vp build",
+    "test": "vp test",
+    "check": "vp check",
+    "preview": "vp preview"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "catalog:",
+    "vite-plugin-singlefile": "^2.3.4",
+    "vite-plus": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.14.0",
+      "onFail": "download"
+    }
+  }
+}
