@@ -1,0 +1,1 @@
+- [Not an artifact](project_not_an_artifact.md) — artifact-only page rules dropped 2026-10-20; keep single-file build only

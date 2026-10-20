@@ -1,97 +1,63 @@
+// Entry point: mounts the app and installs page-wide keyboard and gesture handlers.
+
 import "./style.css";
+import { App, TRACK_KEYS } from "./app";
+import { renderInto } from "./ui/view";
 
-const ctx = new AudioContext();
+const root =
+  document.getElementById("app") ?? document.body.appendChild(document.createElement("div"));
+root.id = "app";
 
-const PARTIALS: [ratio: number, level: number, decay: number][] = [
-  [1, 1, 0.3],
-  [4, 0.25, 0.06],
-  [9.9, 0.08, 0.02],
-];
+const app = new App((a) => renderInto(root, a));
+app.render();
 
-function playMarimba(time: number, freq = 200) {
-  for (const [ratio, level, decay] of PARTIALS) {
-    const osc = new OscillatorNode(ctx, { type: "sine", frequency: freq * ratio });
-    const gain = new GainNode(ctx, { gain: 0 });
-    gain.gain.setValueAtTime(0, time);
-    gain.gain.linearRampToValueAtTime(0.5 * level, time + 0.002);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + decay);
-    osc.connect(gain).connect(ctx.destination);
-    osc.start(time);
-    osc.stop(time + decay);
+// Audio may only start inside a user gesture: create or resume it on the first one.
+const unlock = () => {
+  app.ensureAudio();
+  window.removeEventListener("pointerdown", unlock, true);
+  window.removeEventListener("keydown", unlock, true);
+};
+window.addEventListener("pointerdown", unlock, true);
+window.addEventListener("keydown", unlock, true);
+
+function isTextEntry(el: Element | null): boolean {
+  if (!el) return false;
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
+  if (el instanceof HTMLInputElement)
+    return !["range", "checkbox", "radio", "button"].includes(el.type);
+  return el instanceof HTMLElement && el.isContentEditable;
+}
+
+window.addEventListener("keydown", (e) => {
+  const target = e.target instanceof Element ? e.target : null;
+  const typing = isTextEntry(target);
+  const mod = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+
+  if (mod && !e.altKey && !typing && (key === "z" || key === "y")) {
+    e.preventDefault();
+    if (key === "y" || e.shiftKey) app.redo();
+    else app.undo();
+    return;
   }
-}
-
-const noiseBuffer = (() => {
-  const len = Math.floor(ctx.sampleRate * 0.02);
-  const buf = new AudioBuffer({ length: len, sampleRate: ctx.sampleRate });
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
-  return buf;
-})();
-
-function playWoodblock(time: number, freq = 400) {
-  const dur = 0.08;
-  const osc = new OscillatorNode(ctx, { type: "sine" });
-  osc.frequency.setValueAtTime(freq * 1.5, time);
-  osc.frequency.exponentialRampToValueAtTime(freq, time + 0.01);
-  const body = new GainNode(ctx, { gain: 0 });
-  body.gain.setValueAtTime(0, time);
-  body.gain.linearRampToValueAtTime(0.6, time + 0.001);
-  body.gain.exponentialRampToValueAtTime(0.001, time + dur);
-  osc.connect(body).connect(ctx.destination);
-  osc.start(time);
-  osc.stop(time + dur);
-
-  const noise = new AudioBufferSourceNode(ctx, { buffer: noiseBuffer });
-  const filter = new BiquadFilterNode(ctx, { type: "bandpass", frequency: freq * 2, Q: 1 });
-  const click = new GainNode(ctx, { gain: 0 });
-  click.gain.setValueAtTime(0.4, time);
-  click.gain.exponentialRampToValueAtTime(0.001, time + 0.015);
-  noise.connect(filter).connect(click).connect(ctx.destination);
-  noise.start(time);
-  noise.stop(time + 0.015);
-}
-
-const LOOKAHEAD_MS = 25;     // how often the scheduler runs
-const SCHEDULE_AHEAD = 0.1;  // seconds of audio scheduled in advance
-let bpm = 120;
-let nextNoteTime = 0;
-let timerId: number | undefined;
-
-function playSine(time: number, freq = 880, dur = 0.05) {
-  const osc = new OscillatorNode(ctx, { type: "sine", frequency: freq });
-  const gain = new GainNode(ctx, { gain: 0 });
-  gain.gain.setValueAtTime(0, time);
-  gain.gain.linearRampToValueAtTime(0.8, time + 0.002);
-  gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
-  osc.connect(gain).connect(ctx.destination);
-  osc.start(time);
-  osc.stop(time + dur);
-}
-
-function scheduler() {
-  while (nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD) {
-    playWoodblock(nextNoteTime);
-    nextNoteTime += 60 / bpm;
+  if (e.key === "Escape") {
+    app.setUi((ui) => {
+      ui.confirm = null;
+      ui.dialog = null;
+    });
+    return;
   }
-  timerId = window.setTimeout(scheduler, LOOKAHEAD_MS);
-}
-
-async function start() {
-  await ctx.resume(); // must be called from a user gesture (click/keydown)
-  nextNoteTime = ctx.currentTime + 0.05;
-  scheduler();
-}
-
-function stop() {
-  clearTimeout(timerId);
-}
-
-start();
-
-setTimeout(stop, 60_000);
-
-// setInterval(() => {
-
-// console.log(ctx.currentTime);
-// }, 1000);
+  // Space plays/stops unless a control has focus (buttons and inputs use Space themselves).
+  if (e.key === " " && !target?.closest("input, select, textarea, button, a, [contenteditable]")) {
+    e.preventDefault();
+    app.togglePlay();
+    return;
+  }
+  if (mod || e.altKey || typing || e.repeat) return;
+  const index = TRACK_KEYS.indexOf(key);
+  const track = index >= 0 ? app.pattern.tracks[index] : undefined;
+  if (track) {
+    e.preventDefault();
+    app.recordHit(track);
+  }
+});
